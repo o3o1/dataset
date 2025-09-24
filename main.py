@@ -556,15 +556,21 @@ def parse_category_ratio(value: str) -> Dict[str, float]:
     return ratio
 
 
-def is_sample_valid(category: str, module_types: List[str]) -> bool:
-    actual = set(module_types)
-    if category == "atomic":
-        return actual == {"atomic"}
-    if category == "atomic_hybrid":
-        return actual.issubset({"atomic", "hybrid"}) and {"atomic", "hybrid"}.issubset(actual)
-    if category == "atomic_hybrid_composite":
-        return {"atomic", "hybrid", "composite"}.issubset(actual)
-    raise ValueError(f"Unknown category '{category}'")
+def is_sample_valid(selected_types: Iterable[str], module_types: Iterable[str]) -> bool:
+    selected_set = set(selected_types)
+    actual_set = set(module_types)
+
+    if not selected_set:
+        return False
+
+    if "composite" in selected_set:
+        allowed_types = {"atomic", "hybrid", "composite"}
+    elif "hybrid" in selected_set:
+        allowed_types = {"atomic", "hybrid"}
+    else:
+        allowed_types = {"atomic"}
+
+    return selected_set.issubset(actual_set) and actual_set.issubset(allowed_types)
 
 
 def generate_negative_netlist(
@@ -960,7 +966,8 @@ def run_random(args: argparse.Namespace) -> None:
                 )
                 processing_result = process_netlist(netlist_lines, module_definitions)
                 modules = processing_result["modules"]
-                if is_sample_valid(selected_types, modules):
+                module_types = [module["module_type"] for module in modules]
+                if is_sample_valid(selected_types, module_types):
                     entry = {
                         "input": {"netlist": netlist_lines},
                         "output": processing_result,
@@ -972,7 +979,7 @@ def run_random(args: argparse.Namespace) -> None:
                     success = True
                     break
                 last_error = (
-                    f"Generated sample contains module types {sorted({m['module_type'] for m in modules})} "
+                    f"Generated sample contains module types {sorted(set(module_types))} "
                     f"which violates target types {sorted(set(selected_types))}"
                 )
             if not success:

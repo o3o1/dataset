@@ -1,3 +1,1 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:9c1b00274e060dc9a90d1eb7545d8bfb712ab9c1048b1c3039d11cd78725f56b
-size 83
+{"netlist": ["/N1 D1(1) S2(1) D2(2)", "/N2 S1(1) D1(2) S2(2)", "/N3 D2(1) S1(2)"]}

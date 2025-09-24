@@ -1,3 +1,166 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:8cd0a801be4054309922ec72c8533ef6930c9edda7a810689511a0032f961b5d
-size 5145
+{
+  "modules": [
+    {
+      "name": "rectifier_type1",
+      "placeholders": [
+        {"name": "Dx", "type": "D", "pins": ["1", "2"]},
+        {"name": "Dy", "type": "D", "pins": ["1", "2"]}
+      ],
+      "constraints": [
+        {
+          "node_role": "shared",
+          "pins": [
+            {"placeholder": "Dx", "pin": "2", "role": "Dx_shared"},
+            {"placeholder": "Dy", "pin": "2", "role": "Dy_shared"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "placeholder": "Dx", "pin": "1"},
+        {"module_pin": 2, "node_role": "shared"},
+        {"module_pin": 3, "placeholder": "Dy", "pin": "1"}
+      ]
+    },
+    {
+      "name": "rectifier_type2",
+      "placeholders": [
+        {"name": "Dx", "type": "D", "pins": ["1", "2"]},
+        {"name": "Dy", "type": "D", "pins": ["1", "2"]}
+      ],
+      "constraints": [
+        {
+          "node_role": "shared",
+          "pins": [
+            {"placeholder": "Dx", "pin": "1", "role": "Dx_shared"},
+            {"placeholder": "Dy", "pin": "1", "role": "Dy_shared"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "placeholder": "Dx", "pin": "2"},
+        {"module_pin": 2, "node_role": "shared"},
+        {"module_pin": 3, "placeholder": "Dy", "pin": "2"}
+      ]
+    },
+    {
+      "name": "halfbridge",
+      "placeholders": [
+        {"name": "Sx", "type": "S", "pins": ["1", "2"]},
+        {"name": "Sy", "type": "S", "pins": ["1", "2"]}
+      ],
+      "constraints": [
+        {
+          "node_role": "mid",
+          "pins": [
+            {"placeholder": "Sx", "pin": "1", "role": "Sx_mid"},
+            {"placeholder": "Sy", "pin": "2", "role": "Sy_mid"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "placeholder": "Sx", "pin": "2"},
+        {"module_pin": 2, "node_role": "mid"},
+        {"module_pin": 3, "placeholder": "Sy", "pin": "1"}
+      ]
+    },
+    {
+      "name": "filter",
+      "placeholders": [
+        {"name": "Lx", "type": "L"},
+        {"name": "Cy", "type": "C"}
+      ],
+      "constraints": [
+        {
+          "node_role": "junction",
+          "pins": [
+            {"placeholder": "Lx", "pins": ["1", "2"], "role": "L_shared"},
+            {"placeholder": "Cy", "pins": ["1", "2"], "role": "C_shared"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "placeholder": "Lx", "exclude_roles": ["L_shared"]},
+        {"module_pin": 2, "placeholder": "Cy", "exclude_roles": ["C_shared"]}
+      ]
+    },
+    {
+      "name": "LLC",
+      "placeholders": [
+        {"name": "F", "type": "filter", "pins": ["1", "2"]},
+        {"name": "Lr", "type": "L", "pins": ["1", "2"]}
+      ],
+      "constraints": [
+        {
+          "node_role": "mid",
+          "pins": [
+            {"placeholder": "F", "pin": "1", "role": "filter_L"},
+            {"placeholder": "Lr", "pins": ["1", "2"], "role": "L_shared"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "placeholder": "F", "pin": "2"},
+        {"module_pin": 2, "node_role": "mid"},
+        {"module_pin": 3, "placeholder": "Lr", "exclude_roles": ["L_shared"]}
+      ]
+    },
+    {
+      "name": "fullbridge",
+      "placeholders": [
+        {"name": "HB1", "type": "halfbridge", "pins": ["1", "2", "3"]},
+        {"name": "HB2", "type": "halfbridge", "pins": ["1", "2", "3"]}
+      ],
+      "constraints": [
+        {
+          "node_role": "node1",
+          "pins": [
+            {"placeholder": "HB1", "pin": "1", "role": "HB1_top"},
+            {"placeholder": "HB2", "pins": ["1", "3"], "role": "HB2_top"}
+          ]
+        },
+        {
+          "node_role": "node2",
+          "pins": [
+            {"placeholder": "HB1", "pin": "3", "role": "HB1_bottom"},
+            {"placeholder": "HB2", "pins": ["1", "3"], "role": "HB2_bottom"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "node_role": "node1"},
+        {"module_pin": 2, "node_role": "node2"},
+        {"module_pin": 3, "placeholder": "HB1", "pin": "2"},
+        {"module_pin": 4, "placeholder": "HB2", "pin": "2"}
+      ]
+    },
+    {
+      "name": "bridge_rectifier",
+      "placeholders": [
+        {"name": "Rupper", "type": "rectifier_type1", "pins": ["1", "2", "3"]},
+        {"name": "Rlower", "type": "rectifier_type2", "pins": ["1", "2", "3"]}
+      ],
+      "constraints": [
+        {
+          "node_role": "ac1",
+          "pins": [
+            {"placeholder": "Rupper", "pin": "1", "role": "Rupper_ac"},
+            {"placeholder": "Rlower", "pins": ["1", "3"], "role": "Rlower_ac1"}
+          ]
+        },
+        {
+          "node_role": "ac2",
+          "pins": [
+            {"placeholder": "Rupper", "pin": "3", "role": "Rupper_ac2"},
+            {"placeholder": "Rlower", "pins": ["1", "3"], "role": "Rlower_ac2"}
+          ]
+        }
+      ],
+      "pin_mappings": [
+        {"module_pin": 1, "node_role": "ac1"},
+        {"module_pin": 2, "node_role": "ac2"},
+        {"module_pin": 3, "placeholder": "Rupper", "pin": "2"},
+        {"module_pin": 4, "placeholder": "Rlower", "pin": "2"}
+      ]
+    }
+  ]
+}
