@@ -4,10 +4,11 @@ import argparse
 import json
 import random
 import re
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,12 @@ class MatchedModule:
     instance_name: str
     role_pins: Dict[str, Dict[str, str]]
     constraint_pin_usage: Dict[str, Set[str]]
+
+
+@dataclass
+class AtomicSampleSpec:
+    module_count: int
+    preferred_module: Optional[str] = None
 
 
 def load_module_definitions(path: Path) -> List[ModuleDefinition]:
@@ -556,6 +563,60 @@ def parse_category_ratio(value: str) -> Dict[str, float]:
     return ratio
 
 
+def parse_ratio_map(value: str, default_ratio: Dict[str, float]) -> Dict[str, float]:
+    if not value:
+        return default_ratio.copy()
+
+    ratio = default_ratio.copy()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"Invalid ratio segment '{part}', expected format key=value")
+        key, val = part.split("=", 1)
+        key = key.strip()
+        try:
+            ratio[key] = float(val)
+        except ValueError as exc:
+            raise ValueError(f"Invalid ratio value for '{key}': {val}") from exc
+    return ratio
+
+
+def allocate_counts_from_ratio(
+    total: int,
+    ratio: Dict[str, float],
+    keys: Sequence[str],
+) -> Dict[str, int]:
+    if total < 0:
+        raise ValueError("total must be non-negative")
+
+    if total == 0:
+        return {key: 0 for key in keys}
+
+    weights = [max(ratio.get(key, 0.0), 0.0) for key in keys]
+    weight_sum = sum(weights)
+    if weight_sum == 0:
+        weights = [1.0 for _ in keys]
+        weight_sum = float(len(keys))
+
+    raw_counts = [total * weight / weight_sum for weight in weights]
+    base_counts = [int(math.floor(value)) for value in raw_counts]
+    remainder = total - sum(base_counts)
+
+    fractions = [value - base for value, base in zip(raw_counts, base_counts)]
+    order = sorted(
+        range(len(keys)),
+        key=lambda idx: (fractions[idx], weights[idx]),
+        reverse=True,
+    )
+
+    for idx in order[:remainder]:
+        base_counts[idx] += 1
+
+    return {key: base_counts[idx] for idx, key in enumerate(keys)}
+
+
 def is_sample_valid(selected_types: Iterable[str], module_types: Iterable[str]) -> bool:
     selected_set = set(selected_types)
     actual_set = set(module_types)
@@ -573,6 +634,134 @@ def is_sample_valid(selected_types: Iterable[str], module_types: Iterable[str]) 
     return selected_set.issubset(actual_set) and actual_set.issubset(allowed_types)
 
 
+def _copy_nets(
+    nets: Dict[str, List[ComponentPin]]
+) -> Dict[str, List[ComponentPin]]:
+    return {
+        net: [ComponentPin(component=pin.component, pin=pin.pin) for pin in pins]
+        for net, pins in nets.items()
+    }
+
+
+def _component_pin_map(
+    nets: Dict[str, List[ComponentPin]]
+) -> Dict[str, Dict[str, str]]:
+    mapping: Dict[str, Dict[str, str]] = defaultdict(dict)
+    for net, pins in nets.items():
+        for pin in pins:
+            mapping[pin.component][pin.pin] = net
+    return mapping
+
+
+def _find_component_pin(
+    nets: Dict[str, List[ComponentPin]],
+    component: str,
+    pin: str,
+) -> Optional[Tuple[str, int]]:
+    for net, pins in nets.items():
+        for idx, pin_ref in enumerate(pins):
+            if pin_ref.component == component and pin_ref.pin == pin:
+                return net, idx
+    return None
+
+
+def _move_component_pin(
+    nets: Dict[str, List[ComponentPin]],
+    component: str,
+    pin: str,
+    new_net: str,
+) -> bool:
+    location = _find_component_pin(nets, component, pin)
+    if not location:
+        return False
+    net_name, idx = location
+    nets[new_net].append(ComponentPin(component=component, pin=pin))
+    del nets[net_name][idx]
+    if not nets[net_name]:
+        del nets[net_name]
+    return True
+
+
+def _next_net_name(nets: Dict[str, List[ComponentPin]]) -> str:
+    max_index = 0
+    for net in nets.keys():
+        match = re.fullmatch(r"/N(\d+)", net)
+        if match:
+            max_index = max(max_index, int(match.group(1)))
+    return f"/N{max_index + 1}"
+
+
+def _has_unique_component_pins(nets: Dict[str, List[ComponentPin]]) -> bool:
+    seen: Set[Tuple[str, str]] = set()
+    for pins in nets.values():
+        for pin in pins:
+            key = (pin.component, pin.pin)
+            if key in seen:
+                return False
+            seen.add(key)
+    return True
+
+
+def _isolate_all_components(
+    nets: Dict[str, List[ComponentPin]]
+) -> Dict[str, List[ComponentPin]]:
+    component_map = _component_pin_map(nets)
+    new_nets: Dict[str, List[ComponentPin]] = {}
+    index = 1
+    for component, pins in component_map.items():
+        for pin in pins:
+            net_name = f"/N{index}"
+            index += 1
+            new_nets[net_name] = [ComponentPin(component=component, pin=pin)]
+    return new_nets
+
+
+def _collect_module_critical_pins(module: Dict[str, object]) -> List[Tuple[str, str]]:
+    critical: List[Tuple[str, str]] = []
+    placeholders = module.get("placeholders", {})
+    for placeholder, pins in module.get("constraint_pins", {}).items():
+        component = placeholders.get(placeholder)
+        if component is None:
+            continue
+        for pin in pins:
+            critical.append((component, pin))
+    if not critical:
+        for component in placeholders.values():
+            critical.extend((component, str(idx + 1)) for idx in range(2))
+    return critical
+
+
+def _break_single_module(
+    nets: Dict[str, List[ComponentPin]],
+    module: Dict[str, object],
+    rng: random.Random,
+) -> bool:
+    return _detach_module_pins(nets, [module], rng)
+
+
+def _detach_module_pins(
+    nets: Dict[str, List[ComponentPin]],
+    modules: List[Dict[str, object]],
+    rng: random.Random,
+) -> bool:
+    if not modules:
+        return False
+
+    changed = False
+    for module in modules:
+        critical = _collect_module_critical_pins(module)
+        rng.shuffle(critical)
+        for component, pin in critical:
+            if not _find_component_pin(nets, component, pin):
+                continue
+            new_net = _next_net_name(nets)
+            nets.setdefault(new_net, [])
+            if _move_component_pin(nets, component, pin, new_net):
+                changed = True
+                break
+    return changed
+
+
 def generate_negative_netlist(
     base_lines: List[str],
     module_definitions: List[ModuleDefinition],
@@ -581,91 +770,37 @@ def generate_negative_netlist(
     invalidation_prob: float,
     max_mutations: int,
 ) -> List[str]:
-    nets, component_pins = parse_netlist(base_lines)
+    base_nets, _ = parse_netlist(base_lines)
+    base_result = process_netlist(base_lines, module_definitions)
+    modules = base_result.get("modules", [])
 
-    net_names = list(nets.keys())
-    components = list(component_pins.keys())
+    attempts = max(max_mutations, 5)
+    for _ in range(attempts):
+        nets = _copy_nets(base_nets)
 
-    mutations = rng.randint(1, max_mutations)
-    for _ in range(mutations):
-        action = rng.random()
-        if action < mutate_prob and net_names:
-            net = rng.choice(net_names)
-            if nets[net]:
-                pin = rng.choice(nets[net])
-                nets[net].remove(pin)
-                if not nets[net]:
-                    net_names.remove(net)
+        success = False
+        if modules:
+            if len(modules) == 1 and modules[0].get("module_type") == "atomic":
+                success = _break_single_module(nets, modules[0], rng)
+            if not success:
+                success = _detach_module_pins(nets, modules, rng)
+        if not success:
+            nets = _isolate_all_components(base_nets)
+        if not _has_unique_component_pins(nets):
             continue
 
-        if action < mutate_prob * 2 and components:
-            component = rng.choice(components)
-            pin_ids = list(component_pins.get(component, {}).keys())
-            if not pin_ids:
-                continue
-            pin = rng.choice(pin_ids)
-            net = component_pins[component][pin]
-            nets.setdefault(net, [])
-            nets[net] = [p for p in nets[net] if p.component != component or p.pin != pin]
-            new_net = f"/NX{rng.randint(1, 999999)}"
-            nets.setdefault(new_net, []).append(ComponentPin(component=component, pin=pin))
-            component_pins[component][pin] = new_net
-            if new_net not in net_names:
-                net_names.append(new_net)
-            continue
+        mutated_lines = reconstruct_netlist(nets)
+        mutated_result = process_netlist(mutated_lines, module_definitions)
+        if not mutated_result.get("modules"):
+            return mutated_lines
 
-        if action < mutate_prob * 3 and components:
-            component = rng.choice(components)
-            pin_ids = list(component_pins[component].keys()) or ["1", "2", "3"]
-            new_pin = rng.choice(pin_ids)
-            source_net = component_pins[component].get(new_pin)
-            target_net = rng.choice(net_names) if net_names else f"/NX{rng.randint(1, 999999)}"
-            nets.setdefault(target_net, []).append(ComponentPin(component=component, pin=new_pin))
-            component_pins[component][new_pin] = target_net
-            if source_net and source_net in nets:
-                nets[source_net] = [p for p in nets[source_net] if p.component != component or p.pin != new_pin]
-            if target_net not in net_names:
-                net_names.append(target_net)
-            continue
-
-        if action < mutate_prob * 4 and module_definitions:
-            definition = rng.choice(module_definitions)
-            placeholder_names = list(definition.placeholders.keys())
-            if len(placeholder_names) < 2:
-                continue
-            ph_a, ph_b = rng.sample(placeholder_names, 2)
-            def_type_a = definition.placeholders[ph_a].type
-            def_type_b = definition.placeholders[ph_b].type
-            nets.setdefault(f"/NX{rng.randint(1, 999999)}", [])
-            nets.setdefault(f"/NX{rng.randint(1, 999999)}", [])
-            for module in list(nets.values()):
-                new_module = []
-                for pin in module:
-                    component = pin.component
-                    if component.startswith(def_type_a):
-                        component = component.replace(def_type_a, def_type_b, 1)
-                    elif component.startswith(def_type_b):
-                        component = component.replace(def_type_b, def_type_a, 1)
-                    new_module.append(ComponentPin(component=component, pin=pin.pin))
-                module[:] = new_module
-            continue
-
-        if action < mutate_prob * 5:
-            net = f"/NX{rng.randint(1, 999999)}"
-            nets[net] = []
-            net_names.append(net)
-
-    if rng.random() < invalidation_prob:
-        net = f"/NX{rng.randint(1, 999999)}"
-        nets[net] = [ComponentPin(component="BAD", pin="1")]
-
-    lines = []
-    for net_name, pins in nets.items():
-        if not pins:
-            continue
-        pins_str = " ".join(f"{pin.component}({pin.pin})" for pin in pins)
-        lines.append(f"{net_name} {pins_str}")
-    return lines
+    isolated_nets = _isolate_all_components(base_nets)
+    if not _has_unique_component_pins(isolated_nets):
+        return []
+    isolated_lines = reconstruct_netlist(isolated_nets)
+    if not process_netlist(isolated_lines, module_definitions).get("modules"):
+        return isolated_lines
+    return []
 
 
 def generate_random_netlist(
@@ -918,6 +1053,94 @@ def generate_random_netlist(
     return reconstruct_netlist(nets), selected_types
 
 
+def build_atomic_task_list(
+    total_samples: int,
+    single_module_targets: Dict[str, int],
+    module_count_targets: Dict[int, int],
+    four_plus_choices: Sequence[int],
+    seed: int,
+) -> List[AtomicSampleSpec]:
+    tasks: List[AtomicSampleSpec] = []
+
+    for module_name, count in single_module_targets.items():
+        tasks.extend(
+            AtomicSampleSpec(module_count=1, preferred_module=module_name)
+            for _ in range(count)
+        )
+
+    for module_count, count in module_count_targets.items():
+        if module_count == 1:
+            continue
+        tasks.extend(AtomicSampleSpec(module_count=module_count) for _ in range(count))
+
+    rng = random.Random(seed)
+    assigned = sum(module_count_targets.values())
+    four_plus_total = total_samples - assigned
+    for _ in range(four_plus_total):
+        tasks.append(AtomicSampleSpec(module_count=rng.choice(four_plus_choices)))
+
+    rng.shuffle(tasks)
+    return tasks
+
+
+def ensure_atomic_modules(modules: Sequence[Dict[str, object]]) -> bool:
+    return all(module.get("module_type") == "atomic" for module in modules)
+
+
+def add_atomic_noise_components(netlist_lines: List[str], rng: random.Random) -> List[str]:
+    nets, component_pins = parse_netlist(netlist_lines)
+
+    existing_components = set(component_pins.keys())
+    existing_nets = set(nets.keys())
+
+    net_index = 0
+    net_pattern = re.compile(r"/N(\d+)")
+    for net_name in existing_nets:
+        match = net_pattern.fullmatch(net_name)
+        if match:
+            net_index = max(net_index, int(match.group(1)))
+
+    noise_prefixes = ("S", "D", "L", "C")
+    prefix_next_index: Dict[str, int] = {prefix: 1 for prefix in noise_prefixes}
+    component_pattern = re.compile(r"([A-Za-z]+)(\d+)$")
+    for name in existing_components:
+        match = component_pattern.match(name)
+        if not match:
+            continue
+        prefix, number = match.groups()
+        if prefix in prefix_next_index:
+            prefix_next_index[prefix] = max(prefix_next_index[prefix], int(number) + 1)
+
+    def new_component_name(prefix: str) -> str:
+        index = prefix_next_index.get(prefix, 1)
+        while True:
+            candidate = f"{prefix}{index}"
+            if candidate not in existing_components:
+                existing_components.add(candidate)
+                prefix_next_index[prefix] = index + 1
+                return candidate
+            index += 1
+
+    def new_net_name() -> str:
+        nonlocal net_index
+        net_index += 1
+        name = f"/N{net_index}"
+        existing_nets.add(name)
+        return name
+
+    noise_count = rng.choice([1, 2])
+    augmented_lines = list(netlist_lines)
+
+    for _ in range(noise_count):
+        prefix = rng.choice(noise_prefixes)
+        component = new_component_name(prefix)
+        for pin_idx in range(1, 3):
+            net_name = new_net_name()
+            augmented_lines.append(f"{net_name} {component}({pin_idx})")
+
+    return augmented_lines
+
+
 def run_convert(args: argparse.Namespace) -> None:
     module_definitions = load_module_definitions(args.definitions)
 
@@ -1009,9 +1232,125 @@ def run_random(args: argparse.Namespace) -> None:
                     negative_lines = base_netlist
                 negative_entry = {
                     "input": {"netlist": negative_lines},
-                    "output": {"label": "negative"},
+                    "output": {
+                        "modules": [],
+                        "replaced_netlist": negative_lines,
+                    },
                 }
                 f_neg.write(json.dumps(negative_entry, ensure_ascii=False) + "\n")
+
+
+def run_atomic(args: argparse.Namespace) -> None:
+    module_definitions = load_module_definitions(args.definitions)
+
+    total_samples = args.samples
+    if total_samples < 0:
+        raise ValueError("--samples 必须为非负整数")
+
+    default_module_count_ratio = {
+        "1": 0.55,
+        "2": 0.30,
+        "3": 0.12,
+        "4+": 0.03,
+    }
+    module_count_ratio = parse_ratio_map(args.module_count_ratio, default_module_count_ratio)
+    module_count_distribution = allocate_counts_from_ratio(
+        total_samples,
+        module_count_ratio,
+        ["1", "2", "3", "4+"],
+    )
+    module_count_targets = {
+        1: module_count_distribution.get("1", 0),
+        2: module_count_distribution.get("2", 0),
+        3: module_count_distribution.get("3", 0),
+    }
+
+    default_single_module_ratio = {
+        "rectifier_type1": 0.35,
+        "rectifier_type2": 0.25,
+        "halfbridge": 0.25,
+        "filter": 0.15,
+    }
+    single_module_ratio = parse_ratio_map(args.single_module_ratio, default_single_module_ratio)
+    single_module_targets = allocate_counts_from_ratio(
+        module_count_targets.get(1, 0),
+        single_module_ratio,
+        list(single_module_ratio.keys()),
+    )
+
+    four_plus_tokens = [token.strip() for token in args.four_plus_options.split(",") if token.strip()]
+    if not four_plus_tokens:
+        raise ValueError("--four-plus-options 至少需要一个有效的整数")
+    try:
+        four_plus_choices = [int(token) for token in four_plus_tokens]
+    except ValueError as exc:
+        raise ValueError("--four-plus-options 必须全部为整数") from exc
+    if any(choice < 4 for choice in four_plus_choices):
+        raise ValueError("--four-plus-options 中的值必须不小于 4")
+
+    tasks = build_atomic_task_list(
+        total_samples=total_samples,
+        single_module_targets=single_module_targets,
+        module_count_targets=module_count_targets,
+        four_plus_choices=four_plus_choices,
+        seed=args.task_seed,
+    )
+
+    rng = random.Random(args.seed)
+    type_ratio = {"atomic": 1.0, "hybrid": 0.0, "composite": 0.0}
+
+    entries: List[Dict[str, object]] = []
+    for index, task in enumerate(tasks, 1):
+        for attempt in range(1, args.max_attempts + 1):
+            netlist_lines, _ = generate_random_netlist(
+                module_definitions=module_definitions,
+                rng=rng,
+                min_modules=task.module_count,
+                max_modules=task.module_count,
+                reuse_probability=args.reuse_prob,
+                type_ratio=type_ratio,
+            )
+
+            processing_result = process_netlist(netlist_lines, module_definitions)
+            modules = processing_result["modules"]
+
+            if len(modules) != task.module_count:
+                continue
+            if not ensure_atomic_modules(modules):
+                continue
+            if task.preferred_module is not None:
+                if len(modules) != 1 or modules[0]["module_name"] != task.preferred_module:
+                    continue
+
+            augmented_netlist = add_atomic_noise_components(netlist_lines, rng)
+            augmented_result = process_netlist(augmented_netlist, module_definitions)
+            augmented_modules = augmented_result["modules"]
+
+            if len(augmented_modules) != task.module_count:
+                continue
+            if not ensure_atomic_modules(augmented_modules):
+                continue
+
+            entry = {
+                "input": {"netlist": augmented_netlist},
+                "output": augmented_result,
+            }
+            entries.append(entry)
+            break
+        else:
+            raise RuntimeError(
+                f"无法生成满足要求的样本（编号 {index}，目标模块数 {task.module_count}）"
+            )
+
+    if len(entries) != total_samples:
+        raise RuntimeError(
+            f"生成数量不匹配，期望 {total_samples} 实际 {len(entries)}"
+        )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def run_cli() -> None:
@@ -1069,6 +1408,57 @@ def run_cli() -> None:
         help="单条负例的最大变换次数",
     )
     random_parser.set_defaults(handler=run_random)
+
+    atomic_parser = subparsers.add_parser(
+        "atomic",
+        help="生成仅包含 atomic 模块且带少量噪声器件的数据集",
+    )
+    atomic_parser.add_argument(
+        "--definitions", type=Path, required=True, help="模块定义JSON文件路径"
+    )
+    atomic_parser.add_argument(
+        "--output", type=Path, required=True, help="输出JSONL路径"
+    )
+    atomic_parser.add_argument(
+        "--samples", type=int, default=12_750, help="目标样本总数"
+    )
+    atomic_parser.add_argument(
+        "--seed", type=int, default=2024, help="随机种子（影响模块生成与噪声）"
+    )
+    atomic_parser.add_argument(
+        "--task-seed",
+        type=int,
+        default=4_294_967_291,
+        help="任务排列的随机种子",
+    )
+    atomic_parser.add_argument(
+        "--reuse-prob",
+        type=float,
+        default=0.5,
+        help="生成网表时重用节点的概率",
+    )
+    atomic_parser.add_argument(
+        "--module-count-ratio",
+        default="1=0.55,2=0.30,3=0.12,4+=0.03",
+        help="不同模块数量的目标比例，例如 1=0.55,2=0.30,3=0.12,4+=0.03",
+    )
+    atomic_parser.add_argument(
+        "--single-module-ratio",
+        default="rectifier_type1=0.35,rectifier_type2=0.25,halfbridge=0.25,filter=0.15",
+        help="单模块样本中各模块类型的比例",
+    )
+    atomic_parser.add_argument(
+        "--four-plus-options",
+        default="4,5,6",
+        help="当模块数≥4时允许的具体模块数量，逗号分隔",
+    )
+    atomic_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=5_000,
+        help="为每个样本寻找满足约束的最大尝试次数",
+    )
+    atomic_parser.set_defaults(handler=run_atomic)
 
     args = parser.parse_args()
 
